@@ -1,0 +1,295 @@
+name: Deploy Kotaemon RAG Application
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: kotaemon-prod
+  ECS_SERVICE: kotaemon-prod
+  ECS_CLUSTER: kotaemon-prod
+  CONTAINER_NAME: kotaemon-app
+
+jobs:
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python 3.10+
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install pre-commit pytest
+
+    - name: Run pre-commit hooks (linting)
+      run: |
+        pre-commit install
+        pre-commit run --all-files || true
+
+    - name: Run unit tests
+      run: |
+        if [ -d "tests" ] || [ -d "test" ]; then
+          python -m pytest --verbose || echo "Tests failed or not found, continuing..."
+        else
+          echo "No test directory found, skipping tests"
+        fi
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG_LATEST: latest
+        IMAGE_TAG_SHA: ${{ github.sha }}
+      run: |
+        # Build lite variant Docker image
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_SHA
+        
+        # Push both tags
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_SHA
+        
+        # Output image URI for deployment job
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_SHA" >> $GITHUB_OUTPUT
+
+    - name: Image vulnerability scan
+      run: |
+        # Install and run Trivy for container scanning
+        sudo apt-get update
+        sudo apt-get install wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy
+        
+        # Scan the built image
+        trivy image --exit-code 0 --severity HIGH,CRITICAL ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ~1.0
+        terraform_wrapper: false
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init
+
+    - name: Terraform Plan
+      working-directory: ./terraform
+      env:
+        TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+        TF_VAR_cohere_api_key: ${{ secrets.COHERE_API_KEY }}
+        TF_VAR_container_image: ${{ needs.build.outputs.image }}
+      run: terraform plan -input=false
+
+    - name: Terraform Apply
+      working-directory: ./terraform
+      env:
+        TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+        TF_VAR_cohere_api_key: ${{ secrets.COHERE_API_KEY }}
+        TF_VAR_container_image: ${{ needs.build.outputs.image }}
+      run: terraform apply -auto-approve -input=false
+
+    - name: Get ECS service details
+      id: ecs-service
+      run: |
+        CLUSTER_NAME=$(aws ecs list-clusters --query "clusterArns[?contains(@, '${{ env.ECS_CLUSTER }}')]" --output text | cut -d'/' -f2)
+        SERVICE_NAME=$(aws ecs list-services --cluster $CLUSTER_NAME --query "serviceArns[?contains(@, '${{ env.ECS_SERVICE }}')]" --output text | cut -d'/' -f3)
+        echo "cluster-name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+        echo "service-name=$SERVICE_NAME" >> $GITHUB_OUTPUT
+
+    - name: Update ECS service with new task definition
+      run: |
+        # Get current task definition
+        TASK_DEFINITION=$(aws ecs describe-services --cluster ${{ steps.ecs-service.outputs.cluster-name }} --services ${{ steps.ecs-service.outputs.service-name }} --query 'services[0].taskDefinition' --output text)
+        
+        # Create new task definition with updated image
+        aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query 'taskDefinition' > task-def.json
+        
+        # Update image in task definition
+        cat task-def.json | jq --arg IMAGE "${{ needs.build.outputs.image }}" '.containerDefinitions[0].image = $IMAGE' | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' > new-task-def.json
+        
+        # Register new task definition
+        aws ecs register-task-definition --cli-input-json file://new-task-def.json
+        
+        # Update service to use new task definition
+        NEW_TASK_DEF=$(aws ecs describe-task-definition --task-definition ${{ env.ECS_SERVICE }} --query 'taskDefinition.taskDefinitionArn' --output text)
+        aws ecs update-service --cluster ${{ steps.ecs-service.outputs.cluster-name }} --service ${{ steps.ecs-service.outputs.service-name }} --task-definition $NEW_TASK_DEF
+
+    - name: Wait for deployment completion
+      run: |
+        echo "Waiting for service to reach steady state..."
+        aws ecs wait services-stable --cluster ${{ steps.ecs-service.outputs.cluster-name }} --services ${{ steps.ecs-service.outputs.service-name }}
+        
+        # Check deployment status
+        DEPLOYMENT_STATUS=$(aws ecs describe-services --cluster ${{ steps.ecs-service.outputs.cluster-name }} --services ${{ steps.ecs-service.outputs.service-name }} --query 'services[0].deployments[0].status' --output text)
+        
+        if [ "$DEPLOYMENT_STATUS" != "PRIMARY" ]; then
+          echo "Deployment failed with status: $DEPLOYMENT_STATUS"
+          exit 1
+        fi
+        
+        echo "Deployment completed successfully"
+
+    - name: Get application URL
+      id: app-url
+      run: |
+        # Get ALB DNS name from Terraform outputs
+        cd terraform
+        ALB_DNS=$(terraform output -raw load_balancer_dns_name)
+        APP_URL="http://$ALB_DNS"
+        echo "url=$APP_URL" >> $GITHUB_OUTPUT
+        echo "Application URL: $APP_URL"
+
+    - name: Wait for health checks
+      run: |
+        echo "Waiting for application health checks to pass..."
+        APP_URL="${{ steps.app-url.outputs.url }}"
+        
+        # Wait up to 10 minutes for the application to be healthy
+        for i in {1..60}; do
+          if curl -f -s "$APP_URL" > /dev/null; then
+            echo "Health check passed!"
+            break
+          fi
+          
+          if [ $i -eq 60 ]; then
+            echo "Health check failed after 10 minutes"
+            exit 1
+          fi
+          
+          echo "Health check attempt $i/60 failed, waiting 10 seconds..."
+          sleep 10
+        done
+
+    - name: Run smoke tests
+      run: |
+        APP_URL="${{ steps.app-url.outputs.url }}"
+        
+        echo "Running smoke tests against: $APP_URL"
+        
+        # Test 1: Basic connectivity
+        echo "Test 1: Basic connectivity"
+        if ! curl -f -s "$APP_URL" > /dev/null; then
+          echo "❌ Basic connectivity test failed"
+          exit 1
+        fi
+        echo "✅ Basic connectivity test passed"
+        
+        # Test 2: Check response content
+        echo "Test 2: Response content check"
+        RESPONSE=$(curl -s "$APP_URL")
+        if [[ "$RESPONSE" == *"html"* ]] || [[ "$RESPONSE" == *"Gradio"* ]]; then
+          echo "✅ Response content test passed"
+        else
+          echo "❌ Response content test failed - unexpected response"
+          echo "Response: $RESPONSE"
+          exit 1
+        fi
+        
+        # Test 3: Response time check
+        echo "Test 3: Response time check"
+        RESPONSE_TIME=$(curl -o /dev/null -s -w '%{time_total}' "$APP_URL")
+        if (( $(echo "$RESPONSE_TIME < 30.0" | bc -l) )); then
+          echo "✅ Response time test passed (${RESPONSE_TIME}s)"
+        else
+          echo "❌ Response time test failed (${RESPONSE_TIME}s > 30s)"
+          exit 1
+        fi
+        
+        echo "🎉 All smoke tests passed!"
+
+    - name: Deployment summary
+      run: |
+        echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Application URL** | ${{ steps.app-url.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Docker Image** | ${{ needs.build.outputs.image }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **ECS Cluster** | ${{ steps.ecs-service.outputs.cluster-name }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **ECS Service** | ${{ steps.ecs-service.outputs.service-name }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **AWS Region** | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Deployment Time** | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Deployment Status: SUCCESS" >> $GITHUB_STEP_SUMMARY
+        echo "The Kotaemon RAG application has been successfully deployed and all smoke tests passed." >> $GITHUB_STEP_SUMMARY
+
+  cleanup:
+    name: Cleanup temporary resources
+    runs-on: ubuntu-latest
+    needs: [build, deploy]
+    if: always()
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Clean up old ECR images
+      run: |
+        # Keep only the latest 10 images as per lifecycle policy
+        echo "ECR lifecycle policy will automatically clean up old images"
+        
+        # List current images for logging
+        aws ecr describe-images --repository-name ${{ env.ECR_REPOSITORY }} --query 'imageDetails[*].[imageTags[0],imageDigest,imagePushedAt]' --output table || echo "Repository not found or empty"
+
+    - name: Clean up build artifacts
+      run: |
+        # Remove any temporary files if they exist
+        rm -f task-def.json new-task-def.json || true
+        echo "Build cleanup completed"

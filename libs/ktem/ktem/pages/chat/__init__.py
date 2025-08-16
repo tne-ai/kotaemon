@@ -225,7 +225,12 @@ class ChatPage(BasePage):
             with gr.Column(scale=1, elem_id="conv-settings-panel") as self.conv_column:
                 self.chat_control = ConversationControl(self._app)
 
+                # Hide specific indices from the left-hand panel
+                HIDDEN_INDEX_NAMES = {"GraphRAG Collection", "LightRAG Collection"}
+
                 for index_id, index in enumerate(self._app.index_manager.indices):
+                    if getattr(index, "name", None) in HIDDEN_INDEX_NAMES:
+                        continue
                     index.selector = None
                     index_ui = index.get_selector_component_ui()
                     if not index_ui:
@@ -270,38 +275,12 @@ class ChatPage(BasePage):
 
                 self.chat_suggestion = ChatSuggestion(self._app)
 
-                if len(self._app.index_manager.indices) > 0:
-                    quick_upload_label = (
-                        "Quick Upload" if not KH_DEMO_MODE else "Or input new paper URL"
-                    )
+                # Remove Quick Upload section from UI, but keep hidden placeholders for code references
+                self.quick_file_upload_status = gr.Markdown(visible=False)
+                self.quick_file_upload = gr.File(visible=False)
+                self.quick_urls = gr.Textbox(visible=False)
 
-                    with gr.Accordion(label=quick_upload_label) as _:
-                        self.quick_file_upload_status = gr.Markdown()
-                        if not KH_DEMO_MODE:
-                            self.quick_file_upload = File(
-                                file_types=list(KH_DEFAULT_FILE_EXTRACTORS.keys()),
-                                file_count="multiple",
-                                container=True,
-                                show_label=False,
-                                elem_id="quick-file",
-                            )
-                        self.quick_urls = gr.Textbox(
-                            placeholder=(
-                                "Or paste URLs"
-                                if not KH_DEMO_MODE
-                                else "Paste Arxiv URLs\n(https://arxiv.org/abs/xxx)"
-                            ),
-                            lines=1,
-                            container=False,
-                            show_label=False,
-                            elem_id=(
-                                "quick-url" if not KH_DEMO_MODE else "quick-url-demo"
-                            ),
-                        )
-
-                if not KH_DEMO_MODE:
-                    self.report_issue = ReportIssue(self._app)
-                else:
+                if KH_DEMO_MODE:
                     with gr.Accordion(label="Related papers", open=False):
                         self.related_papers = gr.Markdown(elem_id="related-papers")
 
@@ -784,28 +763,29 @@ class ChatPage(BasePage):
         )
 
         if not KH_DEMO_MODE:
-            # user feedback events
+            # user feedback events (feedback UI removed from sidebar)
             self.chat_panel.chatbot.like(
                 fn=self.is_liked,
                 inputs=[self.chat_control.conversation_id],
                 outputs=None,
             )
-            self.report_issue.report_btn.click(
-                self.report_issue.report,
-                inputs=[
-                    self.report_issue.correctness,
-                    self.report_issue.issues,
-                    self.report_issue.more_detail,
-                    self.chat_control.conversation_id,
-                    self.chat_panel.chatbot,
-                    self._app.settings_state,
-                    self._app.user_id,
-                    self.info_panel,
-                    self.state_chat,
-                ]
-                + self._indices_input,
-                outputs=None,
-            )
+            if hasattr(self, "report_issue"):
+                self.report_issue.report_btn.click(
+                    self.report_issue.report,
+                    inputs=[
+                        self.report_issue.correctness,
+                        self.report_issue.issues,
+                        self.report_issue.more_detail,
+                        self.chat_control.conversation_id,
+                        self.chat_panel.chatbot,
+                        self._app.settings_state,
+                        self._app.user_id,
+                        self.info_panel,
+                        self.state_chat,
+                    ]
+                    + self._indices_input,
+                    outputs=None,
+                )
 
         self.reasoning_type.change(
             self.reasoning_changed,
